@@ -79,16 +79,74 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+
+        raw_claims = report.get("claims")
+        if not isinstance(raw_claims, list):
+            return report
+
+        def _find_observed_doc(target_text: str, exclude_id: str | None = None):
+            if not getattr(ctx, "corpus", None) or not target_text:
+                return None
+            for doc in ctx.corpus.docs:
+                if exclude_id and doc.doc_id == exclude_id:
+                    continue
+                if doc.body in ctx.observed_text and any(
+                    target_text in line for line in doc.body.splitlines()
+                ):
+                    return doc
+            return None
+
+        kept_claims = []
+        split_occurred = False
+
+        for claim in raw_claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            if text in ctx.observed_text:
+                kept_claims.append(claim)
+                continue
+
+            # Try splitting fused sentences joined by ' và '
+            valid_split = False
+            delimiter = " và "
+            start = 0
+            while True:
+                idx = text.find(delimiter, start)
+                if idx == -1:
+                    break
+                left = text[:idx]
+                right = text[idx + len(delimiter):]
+                if left and right and left in ctx.observed_text and right in ctx.observed_text:
+                    doc_a = _find_observed_doc(left)
+                    if doc_a:
+                        doc_b = _find_observed_doc(right, exclude_id=doc_a.doc_id)
+                        if doc_b:
+                            kept_claims.append({"text": left, "doc_id": doc_a.doc_id})
+                            kept_claims.append({"text": right, "doc_id": doc_b.doc_id})
+                            valid_split = True
+                            split_occurred = True
+                            break
+                start = idx + len(delimiter)
+
+            if not valid_split:
+                # Unsupported / fabricated claim: drop it
+                continue
+
+        if not kept_claims:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = "Không có đủ bằng chứng xác thực trong tài liệu để trả lời câu hỏi."
+        else:
+            report["claims"] = kept_claims
+            if split_occurred:
+                report["abstain"] = True
+            report["citations"] = sorted({c["doc_id"] for c in kept_claims if c.get("doc_id")})
+
+        return report
