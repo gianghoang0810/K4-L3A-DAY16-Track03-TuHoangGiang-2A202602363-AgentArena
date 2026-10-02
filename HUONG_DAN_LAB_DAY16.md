@@ -301,7 +301,7 @@ python3 scripts/leaderboard.py runs/baseline.json runs/full-stack.json
    Đảm bảo chỉ có các thay đổi trong `harness/` và tài liệu hướng dẫn. Thư mục `runs/` và `.venv/` được giữ nguyên trong gitignore.
 2. **Commit và Push:**
    ```bash
-   git add harness/ HUONG_DAN_LAB_DAY16.md PLAN.md
+   git add harness/ HUONG_DAN_LAB_DAY16.md
    git commit -m "Agent Arena - Hoan thanh 5 harness layers - Tu Hoang Giang - 2A202602363"
    git push origin main
    ```
