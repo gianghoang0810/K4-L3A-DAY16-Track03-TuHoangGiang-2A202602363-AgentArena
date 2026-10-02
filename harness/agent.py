@@ -81,25 +81,30 @@ through the keyword argument that already existed.
 
     ReActAgent(model, tools, trace, system_prompt=ARENA_SYSTEM_PROMPT_REAL)
 
-**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.**
+The constructor selects that prompt automatically for `RealModel`
+(including the runner's public `inner` wrapper) when the supplied prompt
+is exactly the bare default. Explicit custom/runner addenda are preserved.
 
-The DEFAULT is still the bare frozen `ARENA_SYSTEM_PROMPT`, and that is a
-measured decision rather than caution. On `MockModel` the addendum is
+On `MockModel` the default remains the bare frozen prompt. The addendum is
 behaviourally NEUTRAL — grounding, safety and tool calls are
 byte-identical across all 30 trap-spanning runs — but `arena.model`
 estimates prompt tokens as `len(conversation) // 4`, so a 2,792-character
 addendum adds ~698 tokens to EVERY turn of a mock run and costs 1.28
 points of efficiency against the mock's 12,000-token budget (14.39 ->
 13.11), moving the practice ladder from 92.52 to 91.24. That is an
-artefact of the mock's estimator, not a real cost, and the practice
-ladder is a fixed acceptance artefact. Defaulting it off keeps the two
-paths honest: the mock ladder stays byte-identical, and the real path
-opts in explicitly.
+artefact of the mock's estimator, and the practice ladder is a fixed
+acceptance artefact. Leaving mock unchanged preserves that comparison.
 
 The ~700 prompt tokens per call ARE a real cost on a real endpoint, and
 the scored round's per-brief `max_tokens` is sized with them included. If
 you switch the addendum on, measure your own efficiency delta with
 `scripts/run_practice.py --prompt-addendum` before assuming it is free.
+
+RealModel also enables a bounded evidence guard: a premature FINAL can
+receive up to three corrective messages requesting search, a clean fetch,
+or a different query before abstaining. No ACTION/claim/FINAL is invented.
+Custom adapters can opt in with evidence_guard=True. The guard preserves
+the last model-authored FINAL if subsequent turns exhaust the step cap.
 """
 
 from __future__ import annotations
@@ -110,6 +115,8 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
+    is_degraded,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -152,6 +159,10 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+# Separate from parser/template deferrals: at most three opportunities to
+# recover evidence before accepting the model's own final report.
+MAX_EVIDENCE_DEFERRALS = 3
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -471,6 +482,7 @@ class ReActAgent:
         corpus=None,
         max_steps: int = MAX_STEPS,
         system_prompt: str = ARENA_SYSTEM_PROMPT,
+        evidence_guard: bool | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
@@ -480,6 +492,15 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
+        inner_model = getattr(self.model, "inner", self.model)
+        self.evidence_guard = (
+            isinstance(inner_model, RealModel) if evidence_guard is None else evidence_guard
+        )
+        if (
+            system_prompt == ARENA_SYSTEM_PROMPT
+            and isinstance(inner_model, RealModel)
+        ):
+            system_prompt = ARENA_SYSTEM_PROMPT_REAL
         self.system_prompt = system_prompt
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
@@ -512,6 +533,9 @@ class ReActAgent:
         ]
         self.middleware.before_agent(ctx)
 
+        if self.evidence_guard:
+            ctx.state["evidence_guard"] = {"deferrals": 0, "queries": set(), "clean_reads": 0}
+
         report: dict = {}
         ctx.stop_reason = "max_steps"
         for step in range(self.max_steps):
@@ -532,6 +556,11 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                nudge = self._evidence_nudge(ctx, parsed.final)
+                if nudge:
+                    self._refused_final = parsed.final if isinstance(parsed.final, dict) else {}
+                    ctx.messages.append({"role": "user", "content": nudge})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -560,6 +589,50 @@ class ReActAgent:
         return report
 
     # -- reading the model ---------------------------------------------
+
+    def _evidence_nudge(self, ctx: AgentContext, report: dict) -> str:
+        """Ask for evidence, never manufacture an ACTION, claim or FINAL.
+
+        Real adapters opt in automatically; custom adapters may pass
+        evidence_guard=True. Mock/custom defaults retain their protocol.
+        Both the correction count and remaining tool/step budget bound this.
+        """
+        if not self.evidence_guard or ctx.step + 1 >= self.max_steps:
+            return ""
+        state = ctx.state["evidence_guard"]
+        if state["deferrals"] >= MAX_EVIDENCE_DEFERRALS:
+            return ""
+        remaining = (
+            float("inf") if ctx.max_tool_calls is None
+            else ctx.max_tool_calls - ctx.tools.calls - 1
+        )
+        if not state["queries"] and remaining >= 2:
+            nudge = (
+                "Chưa có kết quả tìm kiếm. Hãy xuất ACTION gọi search theo câu hỏi gốc, "
+                "rồi fetch_doc để đọc bằng chứng trước khi kết luận."
+            )
+        elif state["queries"] and not state["clean_reads"] and remaining >= 1:
+            nudge = (
+                "Chưa đọc được tài liệu đầy đủ. Hãy xuất ACTION gọi fetch_doc với doc_id "
+                "trong kết quả search; nếu không có kết quả phù hợp, đổi truy vấn search."
+            )
+        else:
+            claims = report.get("claims") if isinstance(report, dict) else None
+            supported = isinstance(claims, list) and any(
+                isinstance(c, dict) and isinstance(c.get("text"), str)
+                and ctx.saw(c["text"]) for c in claims
+            )
+            if remaining < 2 or len(state["queries"]) >= 2 or (
+                supported and report.get("abstain") is not True
+            ):
+                return ""
+            nudge = (
+                "Bằng chứng chưa đủ. Hãy xuất ACTION search bằng một truy vấn khác "
+                "dựa trên câu hỏi và nội dung đã đọc, rồi fetch_doc tài liệu liên quan. "
+                "Nếu vẫn thiếu căn cứ, abstain; không bịa hoặc viết lại chữ của claim."
+            )
+        state["deferrals"] += 1
+        return nudge
 
     def _parse(self, text: str):
         """Decode one model turn — with `arena.model.parse_output`, always.
@@ -659,6 +732,12 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if self.evidence_guard and result.ok and result.content and not is_degraded(result.content):
+            state = ctx.state["evidence_guard"]
+            if parsed.tool == "search":
+                state["queries"].add(_as_text(parsed.args.get("query")))
+            elif parsed.tool == "fetch_doc":
+                state["clean_reads"] += 1
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
